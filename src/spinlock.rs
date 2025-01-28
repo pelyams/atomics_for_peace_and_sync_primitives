@@ -1,40 +1,38 @@
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
+use thread_id;
+
 struct SpinLock<T> {
-    owner: UnsafeCell<Option<std::thread::ThreadId>>,
-    locked: std::sync::atomic::AtomicBool,
-    data: UnsafeCell<T>,
+    locking_thread: std::sync::atomic::AtomicUsize,
+    data: UnsafeCell<T>
 }
 
 impl<T> SpinLock<T> {
-    pub fn new(data: T) -> SpinLock<T> {
-        SpinLock {
-            owner: None.into(),
-            locked: std::sync::atomic::AtomicBool::new(false),
-            data: data.into(),
-        }
+pub fn new(data: T) -> SpinLock<T> {
+    SpinLock {
+        locking_thread: std::sync::atomic::AtomicUsize::new(0),
+        data: data.into(),
     }
+}
 
-    pub fn lock(&self) -> SpinGuard<T> {
-        let current_thread = std::thread::current().id();
-        unsafe {
-            if let Some(thread_id) = *self.owner.get() {
-                if current_thread == thread_id {
-                    panic!("This spinlock is not supposed for re-entrance")
-                }
+pub fn lock(&self) -> SpinGuard<T> {
+    let current_thread = thread_id::get();
+    loop {
+        let state = self.locking_thread.load(Ordering::Relaxed);
+        if state == current_thread {
+            panic!("This spinlock is not supposed for re-entrance");
+        }
+        match state {
+            0 if self.locking_thread.compare_exchange_weak(
+                0,
+                current_thread,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ).is_ok() => break,
+            current_thread=> panic!("This spinlock is not supposed for re-entrance"),
+            _ => std::hint::spin_loop(),
             }
-        }
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            std::hint::spin_loop();
-        }
-        unsafe {
-            let owner = self.owner.get();
-            *owner = Some(current_thread);
         }
         SpinGuard { sl: self }
     }
@@ -55,8 +53,7 @@ impl<T> SpinGuard<'_, T> {
 
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
-        unsafe { *(self.sl.owner.get()) = None.into() }
-        self.sl.locked.store(false, Ordering::Release);
+        self.sl.locking_thread.store(0, Ordering::Release);
     }
 }
 
