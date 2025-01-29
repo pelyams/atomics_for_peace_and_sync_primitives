@@ -1,71 +1,107 @@
-use std::cell::UnsafeCell;
+use std::cell::{UnsafeCell};
 use std::fmt;
 use std::fmt::Formatter;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{Thread, ThreadId};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::thread::{Thread};
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+
+thread_local! {
+    static OWNED_BY_THREAD: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+}
 
 type LockResult<Guard> = Result<Guard, LockError<Guard>>;
 
+const UNLOCKED: u8 = 0;
+const LOCKED: u8 = 1;
+const QUEUEING: u8 = 2;
+
 #[derive(Debug)]
-struct RegularMutex<T> {
+pub struct SlowerMutex<T> {
+    mutex_id: u64,
     data: UnsafeCell<T>,
-    locked: AtomicBool,
-    thread_id: UnsafeCell<Option<ThreadId>>,
+    state: AtomicU8,
     queue: UnsafeCell<std::collections::VecDeque<Thread>>,
     poisoned: UnsafeCell<bool>,
 }
 
-impl<T> RegularMutex<T> {
-    pub fn new(data: T) -> RegularMutex<T> {
-        RegularMutex {
+impl<T> SlowerMutex<T> {
+
+    pub fn new(data: T) -> SlowerMutex<T> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        SlowerMutex {
+            mutex_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             data: data.into(),
-            locked: AtomicBool::new(false),
-            thread_id: None.into(),
+            state: AtomicU8::new(UNLOCKED),
             queue: std::collections::VecDeque::new().into(),
             poisoned: false.into(),
         }
     }
-    pub fn lock(&self) -> LockResult<RegularMutexGuard<'_,T>> {
-        let acquiring_thread = std::thread::current().id();
-        unsafe {
-            if let Some(thread_id) = *self.thread_id.get() {
-                if acquiring_thread == thread_id {
-                    return Err(LockError::WouldBlock);
-                }
-            }
+    pub fn lock(&self) -> LockResult<SlowerMutexGuard<'_,T>> {
+
+        if OWNED_BY_THREAD.with(|owned_mutexes| {
+            owned_mutexes.borrow().get(&self.mutex_id).is_some()
+        }) == true {
+            return Err(LockError::WouldBlock);
         }
 
-        'outer: while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        'outer: loop {
             let mut spin_counter = 0;
-            while spin_counter <= 100
-            {
-                std::hint::spin_loop();
-                if self
-                    .locked
-                    .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok() {
-                    break 'outer;
+            while spin_counter < 100 {
+                let state = self.state.load(Ordering::Relaxed);
+                match state {
+                    UNLOCKED => {
+                        if self.state.compare_exchange_weak(
+                            UNLOCKED,
+                            LOCKED,
+                            Ordering::Acquire,
+                            Ordering::Relaxed,
+                        ).is_ok() {
+                            break 'outer;
+                        }
+                    },
+                    QUEUEING => {
+                        if self.state.compare_exchange_weak(
+                            QUEUEING,
+                            LOCKED,
+                            Ordering::Acquire,
+                            Ordering::Relaxed,
+                        ).is_ok() {
+                            // or spin further?!
+                            break 'outer;
+                        }
+                    },
+                    LOCKED => {
+                        spin_counter += 1;
+                    },
+                    _ => (),
                 }
-                spin_counter += 1;
+                std::hint::spin_loop();
             }
-            let current_thread = std::thread::current();
-            let queue = self.queue.get();
-            unsafe { (*queue).push_back(current_thread) };
-            std::thread::park();
+            if self.state.compare_exchange(
+                LOCKED,
+                QUEUEING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ).is_ok() {
+                let current_thread = std::thread::current();
+                unsafe { (*self.queue.get()).push_back(current_thread) };
+                std::thread::park();
+            }
         }
-        unsafe { *self.thread_id.get() = Some(acquiring_thread) };
+        OWNED_BY_THREAD.with(|owned_mutexes| {
+            owned_mutexes.borrow_mut().insert(self.mutex_id);
+        });
         if self.is_poisoned() {
             return Err(LockError::Poisoned(PoisonedLock {
-                guard: RegularMutexGuard { lock: self },
+                guard: SlowerMutexGuard { lock: self },
             }));
         }
 
-        Ok(RegularMutexGuard { lock: self })
+        Ok(SlowerMutexGuard { lock: self })
     }
     pub fn is_poisoned(&self) -> bool {
         unsafe { *self.poisoned.get() }
@@ -75,54 +111,55 @@ impl<T> RegularMutex<T> {
     }
 }
 
-unsafe impl<T: Send> Send for RegularMutex<T> {}
-unsafe impl<T: Send> Sync for RegularMutex<T> {}
+unsafe impl<T: Send> Send for SlowerMutex<T> {}
+unsafe impl<T: Send> Sync for SlowerMutex<T> {}
 
 #[derive(Debug)]
-struct RegularMutexGuard<'a, T> {
-    lock: &'a RegularMutex<T>,
+struct SlowerMutexGuard<'a, T> {
+    lock: &'a SlowerMutex<T>,
 }
 
-impl<T> RegularMutexGuard<'_, T> {
+impl<T> SlowerMutexGuard<'_, T> {
     pub fn unlock(self) {
         drop(self);
     }
 }
 
-impl<T> Drop for RegularMutexGuard<'_, T> {
+impl<T> Drop for SlowerMutexGuard<'_, T> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             unsafe { *self.lock.poisoned.get() = true };
         }
-        unsafe {
-            let thread_id = self.lock.thread_id.get();
-            *thread_id = None;
-        }
-        self.lock.locked.store(false, Ordering::Release);
+        OWNED_BY_THREAD.with(|owned_mutexes| {
+            owned_mutexes.borrow_mut().remove(&self.lock.mutex_id);
+        });
+
         let queue = self.lock.queue.get();
-        unsafe {
-            let thread = (*queue).pop_front();
-            if thread.is_some() {
-                thread.unwrap().unpark();
-            }
-        };
+        let thread_to_unpark = unsafe { (*queue).pop_front() };
+        let has_more_waiters = unsafe { !(*queue).is_empty() };
+        let new_state = if has_more_waiters { QUEUEING } else { UNLOCKED };
+
+        self.lock.state.store(new_state, Ordering::Release);
+        if let Some(t) = thread_to_unpark {
+            t.unpark();
+        }
     }
 }
 
-impl<T> Deref for RegularMutexGuard<'_, T> {
+impl<T> Deref for SlowerMutexGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.lock.data.get() }
     }
 }
 
-impl<T> DerefMut for RegularMutexGuard<'_, T> {
+impl<T> DerefMut for SlowerMutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.lock.data.get() }
     }
 }
 
-impl<T> !Send for RegularMutexGuard<'_, T> {}
+impl<T> !Send for SlowerMutexGuard<'_, T> {}
 
 
 #[derive(Debug)]
@@ -179,11 +216,11 @@ impl<T> fmt::Debug for PoisonedLock<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::mutex::{LockError, RegularMutex};
+    use crate::mutex::{LockError, SlowerMutex};
 
     #[test]
     fn test_basic_locking() {
-        let mutex = RegularMutex::new(4u8);
+        let mutex = SlowerMutex::new(4u8);
         let locked = mutex.lock().unwrap();
         assert_eq!(*locked, 4);
         drop(locked);
@@ -194,7 +231,7 @@ mod tests {
 
     #[test]
     fn test_concurrency() {
-        let mutex = std::sync::Arc::new(RegularMutex::new(0u8));
+        let mutex = std::sync::Arc::new(SlowerMutex::new(0u8));
         {
             let mutex = mutex.clone();
             std::thread::scope(|s| {
@@ -214,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_reentrancy() {
-        let mutex = RegularMutex::new("shared data");
+        let mutex = SlowerMutex::new("shared data");
         let first_lock = mutex.lock();
         let second_lock = mutex.lock();
         assert!(first_lock.is_ok());
@@ -224,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_unlocking_after_panic() {
-        let mutex = std::sync::Arc::new(RegularMutex::new(0u8));
+        let mutex = std::sync::Arc::new(SlowerMutex::new(0u8));
         {
             let mutex = mutex.clone();
             let handle = std::thread::spawn(move || {
@@ -245,3 +282,4 @@ mod tests {
         assert_eq!(*lock_attempt_two.unwrap(), 100);
     }
 }
+

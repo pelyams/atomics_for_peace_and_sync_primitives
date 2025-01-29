@@ -2,53 +2,66 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::fmt::Formatter;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::thread::{ThreadId};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use atomic_wait::{wait, wake_one};
+use std::cell::RefCell;
+use std::collections::HashSet;
 
 type LockResult<Guard> = Result<Guard, LockError<Guard>>;
 
+thread_local! {
+    static OWNED_BY_THREAD: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+}
+
 #[derive(Debug)]
 struct Mutex<T> {
+    mutex_id: u64,
     data: UnsafeCell<T>,
-    thread_id: UnsafeCell<Option<ThreadId>>,
     state: AtomicU32,
     poisoned: UnsafeCell<bool>,
 }
 
 impl<T> Mutex<T> {
     pub fn new(data: T) -> Mutex<T> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Mutex {
+            mutex_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             data: data.into(),
-            thread_id: None.into(),
             state: AtomicU32::new(0),
             poisoned: false.into(),
         }
     }
     pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
-        let acquiring_thread = std::thread::current().id();
-        unsafe {
-            if let Some(thread_id) = *self.thread_id.get() {
-                if acquiring_thread == thread_id {
-                    return Err(LockError::WouldBlock);
-                }
-            }
+        if OWNED_BY_THREAD.with(|owned_mutexes| {
+            owned_mutexes.borrow().get(&self.mutex_id).is_some()
+        }) == true {
+            return Err(LockError::WouldBlock);
         }
-
         if self.state.compare_exchange_weak(0, 1, Ordering::Acquire,  Ordering::Relaxed).is_err() {
             let mut counter = 0;
-            while counter < 100 || self.state.load(Ordering::Acquire) != 1 {
+            while counter < 100 && self.state.load(Ordering::Relaxed) != 0 {
                 counter += 1;
                 std::hint::spin_loop();
             }
-            if self.state.compare_exchange_weak(1, 0, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                while self.state.swap(2, Ordering::Acquire) != 0 {
+            if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                loop {
+                    let state = self.state.load(Ordering::Relaxed);
+                    if state == 0 {
+                        match self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
+                            Ok(_) => break,
+                            Err(_) => continue,
+                        }
+                    }
+                    if state != 2 {
+                        self.state.store(2, Ordering::Relaxed);
+                    }
                     wait(&self.state, 2);
                 }
             }
         }
-
-        unsafe { *self.thread_id.get() = Some(acquiring_thread) };
+        OWNED_BY_THREAD.with(|owned_mutexes| {
+            owned_mutexes.borrow_mut().insert(self.mutex_id);
+        });
         if self.is_poisoned() {
             return Err(LockError::Poisoned(PoisonedLock {
                 guard: MutexGuard { lock: self },
@@ -84,10 +97,9 @@ impl<T> Drop for MutexGuard<'_, T> {
         if std::thread::panicking() {
             unsafe { *self.lock.poisoned.get() = true };
         }
-        unsafe {
-            let thread_id = self.lock.thread_id.get();
-            *thread_id = None;
-        }
+        OWNED_BY_THREAD.with(|owned_mutexes| {
+            owned_mutexes.borrow_mut().remove(&self.lock.mutex_id);
+        });
         if self.lock.state.swap(0,Ordering::Release) == 2 {
             wake_one(&self.lock.state);
         }
