@@ -7,14 +7,16 @@ use atomic_wait::{wait, wake_one};
 use std::cell::RefCell;
 use std::collections::HashSet;
 
-type LockResult<Guard> = Result<Guard, LockError<Guard>>;
+use crate::utils::mutex_common::{ LockError, PoisonedLock };
+
+pub type LockResult<Guard> = Result<Guard, LockError<Guard>>;
 
 thread_local! {
-    static OWNED_BY_THREAD: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+    static ACQUIRED_BY_THREAD: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
 }
 
 #[derive(Debug)]
-struct Mutex<T> {
+pub struct Mutex<T> {
     mutex_id: u64,
     data: UnsafeCell<T>,
     state: AtomicU32,
@@ -32,11 +34,7 @@ impl<T> Mutex<T> {
         }
     }
     pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
-        if OWNED_BY_THREAD.with(|owned_mutexes| {
-            owned_mutexes.borrow().get(&self.mutex_id).is_some()
-        }) == true {
-            return Err(LockError::WouldBlock);
-        }
+        _ = self.acquired_check()?;
         if self.state.compare_exchange_weak(0, 1, Ordering::Acquire,  Ordering::Relaxed).is_err() {
             let mut counter = 0;
             while counter < 100 && self.state.load(Ordering::Relaxed) != 0 {
@@ -59,9 +57,7 @@ impl<T> Mutex<T> {
                 }
             }
         }
-        OWNED_BY_THREAD.with(|owned_mutexes| {
-            owned_mutexes.borrow_mut().insert(self.mutex_id);
-        });
+        self.set_acquired();
         if self.is_poisoned() {
             return Err(LockError::Poisoned(PoisonedLock {
                 guard: MutexGuard { lock: self },
@@ -70,11 +66,60 @@ impl<T> Mutex<T> {
 
         Ok(MutexGuard { lock: self })
     }
+    pub fn try_lock(&self) -> LockResult<MutexGuard<'_, T>> {
+        _ = self.acquired_check()?;
+        if self.state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            self.set_acquired();
+            if self.is_poisoned() {
+                return Err(LockError::Poisoned(
+                    PoisonedLock {
+                        guard: MutexGuard { lock: self },
+                    }
+                ));
+            }
+            return Ok(MutexGuard { lock: self });
+        }
+        Err(LockError::WouldBlock)
+    }
+
     pub fn is_poisoned(&self) -> bool {
         unsafe { *self.poisoned.get() }
     }
+
     pub fn clear_poison(&self) {
         unsafe { *self.poisoned.get() = false };
+    }
+
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
+    #[inline]
+    fn acquired_check<Guard>(&self) -> Result<(), LockError<Guard>> {
+        if ACQUIRED_BY_THREAD.with(
+            |acquired_lock| acquired_lock.borrow().contains(&self.mutex_id)
+        ) {
+            return Err(LockError::WouldBlock);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn set_acquired(&self) {
+        ACQUIRED_BY_THREAD.with(
+            |acquired_lock| acquired_lock.borrow_mut().insert(self.mutex_id)
+        );
+    }
+
+    #[inline]
+    fn remove_acquired(&self) {
+        ACQUIRED_BY_THREAD.with(
+            |acquired_lock| acquired_lock.borrow_mut().remove(&self.mutex_id)
+        );
     }
 }
 
@@ -82,7 +127,7 @@ unsafe impl<T: Send> Send for Mutex<T> {}
 unsafe impl<T: Send> Sync for Mutex<T> {}
 
 #[derive(Debug)]
-struct MutexGuard<'a, T> {
+pub struct MutexGuard<'a, T> {
     lock: &'a Mutex<T>,
 }
 
@@ -97,9 +142,7 @@ impl<T> Drop for MutexGuard<'_, T> {
         if std::thread::panicking() {
             unsafe { *self.lock.poisoned.get() = true };
         }
-        OWNED_BY_THREAD.with(|owned_mutexes| {
-            owned_mutexes.borrow_mut().remove(&self.lock.mutex_id);
-        });
+        self.lock.remove_acquired();
         if self.lock.state.swap(0,Ordering::Release) == 2 {
             wake_one(&self.lock.state);
         }
@@ -120,59 +163,6 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 }
 
 impl<T> !Send for MutexGuard<'_, T> {}
-
-
-#[derive(Debug)]
-enum LockError<Guard> {
-    WouldBlock,
-    Poisoned(PoisonedLock<Guard>),
-}
-
-impl<T> PartialEq for LockError<T> {
-    fn eq(&self, other: &Self) -> bool {
-        match self {
-            LockError::WouldBlock => {
-                if let LockError::WouldBlock = other {
-                    true
-                } else {
-                    false
-                }
-            },
-            LockError::Poisoned(_)  => {
-                if let LockError::WouldBlock = other {
-                    false
-                } else {
-                    true
-                }
-            },
-        }
-    }
-}
-
-impl<T> fmt::Display for LockError<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            LockError::WouldBlock => write!(f, "Error: Can cause blocking"),
-            LockError::Poisoned(_) => write!(f, "Error: Lock is poisoned"),
-        }
-    }
-}
-
-struct PoisonedLock<Guard> {
-    guard: Guard,
-}
-
-impl<T> fmt::Display for PoisonedLock<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "Lock is poisoned!")
-    }
-}
-
-impl<T> fmt::Debug for PoisonedLock<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "Lock is poisoned!")
-    }
-}
 
 #[cfg(test)]
 mod tests {

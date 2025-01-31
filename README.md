@@ -20,7 +20,9 @@ Since atomic property should now have 3 states: UNLOCKED, LOCKED and QUEUING, we
 - Totally duplicates SlowMutex interface
 
 ### RwLock
-[todo]
+- Writer-friendly read-write lock
+- Prevents unnecessary wake_all() calls for reading threads (as a downside, now it an unpleasant number of atomics inside (namely, 3))
+
 
 
 ### Condvar 

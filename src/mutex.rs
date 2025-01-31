@@ -1,19 +1,17 @@
 use std::cell::{UnsafeCell};
-use std::fmt;
-use std::fmt::Formatter;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::thread::{Thread};
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::Arc;
 
+use crate::utils::mutex_common::{ LockError, PoisonedLock };
 
 thread_local! {
-    static OWNED_BY_THREAD: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
+    static ACQUIRED_BY_THREAD: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
 }
 
-type LockResult<Guard> = Result<Guard, LockError<Guard>>;
+pub type LockResult<Guard> = Result<Guard, LockError<Guard>>;
 
 const UNLOCKED: u8 = 0;
 const LOCKED: u8 = 1;
@@ -41,12 +39,7 @@ impl<T> SlowerMutex<T> {
         }
     }
     pub fn lock(&self) -> LockResult<SlowerMutexGuard<'_,T>> {
-
-        if OWNED_BY_THREAD.with(|owned_mutexes| {
-            owned_mutexes.borrow().get(&self.mutex_id).is_some()
-        }) == true {
-            return Err(LockError::WouldBlock);
-        }
+        _ = self.acquired_check()?;
 
         'outer: loop {
             let mut spin_counter = 0;
@@ -92,9 +85,7 @@ impl<T> SlowerMutex<T> {
                 std::thread::park();
             }
         }
-        OWNED_BY_THREAD.with(|owned_mutexes| {
-            owned_mutexes.borrow_mut().insert(self.mutex_id);
-        });
+        self.set_acquired();
         if self.is_poisoned() {
             return Err(LockError::Poisoned(PoisonedLock {
                 guard: SlowerMutexGuard { lock: self },
@@ -103,11 +94,57 @@ impl<T> SlowerMutex<T> {
 
         Ok(SlowerMutexGuard { lock: self })
     }
+    pub fn try_lock(&self) -> LockResult<SlowerMutexGuard<'_,T>> {
+        _ = self.acquired_check()?;
+        if self.state.compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            self.set_acquired();
+            if self.is_poisoned() {
+                return Err(LockError::Poisoned(PoisonedLock {
+                    guard: SlowerMutexGuard { lock: self },
+                }));
+            }
+            return Ok(SlowerMutexGuard { lock: self });
+        }
+        Err(LockError::WouldBlock)
+    }
     pub fn is_poisoned(&self) -> bool {
         unsafe { *self.poisoned.get() }
     }
     pub fn clear_poison(&self) {
         unsafe { *self.poisoned.get() = false };
+    }
+
+    //latter two should ideally be packed into Result returning some err(T)
+    //if mutex is poisoned
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
+
+    #[inline]
+    fn acquired_check<Guard>(&self) -> Result<(), LockError<Guard>> {
+        if ACQUIRED_BY_THREAD.with(
+            |acquired_lock| acquired_lock.borrow().contains(&self.mutex_id)
+        ) {
+            return Err(LockError::WouldBlock);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn set_acquired(&self) {
+        ACQUIRED_BY_THREAD.with(
+            |acquired_lock| acquired_lock.borrow_mut().insert(self.mutex_id)
+        );
+    }
+
+    #[inline]
+    fn remove_acquired(&self) {
+        ACQUIRED_BY_THREAD.with(
+            |acquired_lock| acquired_lock.borrow_mut().remove(&self.mutex_id)
+        );
     }
 }
 
@@ -115,7 +152,7 @@ unsafe impl<T: Send> Send for SlowerMutex<T> {}
 unsafe impl<T: Send> Sync for SlowerMutex<T> {}
 
 #[derive(Debug)]
-struct SlowerMutexGuard<'a, T> {
+pub struct SlowerMutexGuard<'a, T> {
     lock: &'a SlowerMutex<T>,
 }
 
@@ -130,9 +167,7 @@ impl<T> Drop for SlowerMutexGuard<'_, T> {
         if std::thread::panicking() {
             unsafe { *self.lock.poisoned.get() = true };
         }
-        OWNED_BY_THREAD.with(|owned_mutexes| {
-            owned_mutexes.borrow_mut().remove(&self.lock.mutex_id);
-        });
+        self.lock.remove_acquired();
 
         let queue = self.lock.queue.get();
         let thread_to_unpark = unsafe { (*queue).pop_front() };
@@ -161,58 +196,58 @@ impl<T> DerefMut for SlowerMutexGuard<'_, T> {
 
 impl<T> !Send for SlowerMutexGuard<'_, T> {}
 
-
-#[derive(Debug)]
-enum LockError<Guard> {
-    WouldBlock,
-    Poisoned(PoisonedLock<Guard>),
-}
-
-impl<T> PartialEq for LockError<T> {
-    fn eq(&self, other: &Self) -> bool {
-        match self {
-            LockError::WouldBlock => {
-                if let LockError::WouldBlock = other {
-                    true
-                } else {
-                    false
-                }
-            },
-            LockError::Poisoned(_)  => {
-                if let LockError::WouldBlock = other {
-                    false
-                } else {
-                    true
-                }
-            },
-        }
-    }
-}
-
-impl<T> fmt::Display for LockError<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            LockError::WouldBlock => write!(f, "Error: Can cause blocking"),
-            LockError::Poisoned(_) => write!(f, "Error: Lock is poisoned"),
-        }
-    }
-}
-
-struct PoisonedLock<Guard> {
-    guard: Guard,
-}
-
-impl<T> fmt::Display for PoisonedLock<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "Lock is poisoned!")
-    }
-}
-
-impl<T> fmt::Debug for PoisonedLock<T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "Lock is poisoned!")
-    }
-}
+//
+// #[derive(Debug)]
+// pub enum LockError<Guard> {
+//     WouldBlock,
+//     Poisoned(PoisonedLock<Guard>),
+// }
+//
+// impl<T> PartialEq for LockError<T> {
+//     fn eq(&self, other: &Self) -> bool {
+//         match self {
+//             LockError::WouldBlock => {
+//                 if let LockError::WouldBlock = other {
+//                     true
+//                 } else {
+//                     false
+//                 }
+//             },
+//             LockError::Poisoned(_)  => {
+//                 if let LockError::WouldBlock = other {
+//                     false
+//                 } else {
+//                     true
+//                 }
+//             },
+//         }
+//     }
+// }
+//
+// impl<T> fmt::Display for LockError<T> {
+//     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+//         match self {
+//             LockError::WouldBlock => write!(f, "Error: Can cause blocking"),
+//             LockError::Poisoned(_) => write!(f, "Error: Lock is poisoned"),
+//         }
+//     }
+// }
+//
+// pub struct PoisonedLock<Guard> {
+//     guard: Guard,
+// }
+//
+// impl<T> fmt::Display for PoisonedLock<T> {
+//     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+//         write!(f, "Lock is poisoned!")
+//     }
+// }
+//
+// impl<T> fmt::Debug for PoisonedLock<T> {
+//     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+//         write!(f, "Lock is poisoned!")
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -227,6 +262,15 @@ mod tests {
         let mut locked = mutex.lock().unwrap();
         *locked *= 20;
         assert_eq!(*locked, 80);
+    }
+
+    #[test]
+    fn test_try_lock() {
+        let mutex = SlowerMutex::new(4u8);
+        let locked = mutex.lock();
+        let try_locked = mutex.try_lock();
+        assert!(locked.is_ok());
+        assert!(try_locked.is_err());
     }
 
     #[test]

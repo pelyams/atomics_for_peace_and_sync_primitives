@@ -18,21 +18,22 @@ pub fn new(data: T) -> SpinLock<T> {
 
 pub fn lock(&self) -> SpinGuard<T> {
     let current_thread = thread_id::get();
+    let state = self.locking_thread.load(Ordering::Relaxed);
+    if state == current_thread {
+        panic!("This spinlock is not supposed for re-entrance");
+    }
     loop {
-        let state = self.locking_thread.load(Ordering::Relaxed);
-        if state == current_thread {
-            panic!("This spinlock is not supposed for re-entrance");
-        }
-        match state {
-            0 if self.locking_thread.compare_exchange_weak(
+        if self.locking_thread.load(Ordering::Relaxed) == 0 {
+            if self.locking_thread.compare_exchange_weak(
                 0,
                 current_thread,
                 Ordering::Acquire,
                 Ordering::Relaxed,
-            ).is_ok() => break,
-            current_thread=> panic!("This spinlock is not supposed for re-entrance"),
-            _ => std::hint::spin_loop(),
+            ).is_ok() {
+                break;
             }
+        }
+        std::hint::spin_loop();
         }
         SpinGuard { sl: self }
     }
