@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 atomic-wait = "1.1.0"
+thread-id = "5.0.0"
