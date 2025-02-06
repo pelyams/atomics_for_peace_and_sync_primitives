@@ -23,14 +23,12 @@ Since atomic property should now have 3 states: UNLOCKED, LOCKED and QUEUING, we
 - Writer-friendly read-write lock
 - Prevents unnecessary wake_all() calls for reading threads (as a downside, now it an unpleasant number of atomics inside (namely, 3))
 
-
-
 ### Condvar 
-[todo]
+- A very basic implementation. Might remind of other very basic implementations from corresponding literature
 
 ### Semaphore
-[todo]
-
+- Atomic + futex-alike atomic_wait based implementation
+Been considering to use guards for acquiring (and returning permits back in Drop implementation, RAII, you know), but ultimately opted off in favour of semaphore flexibility
 ### Channel
 [todo]
 
