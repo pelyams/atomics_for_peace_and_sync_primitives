@@ -1,6 +1,4 @@
 use std::cell::UnsafeCell;
-use std::fmt;
-use std::fmt::Formatter;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use atomic_wait::{wait, wake_one};
@@ -128,7 +126,7 @@ unsafe impl<T: Send> Sync for Mutex<T> {}
 
 #[derive(Debug)]
 pub struct MutexGuard<'a, T> {
-    lock: &'a Mutex<T>,
+    pub(crate) lock: &'a Mutex<T>,
 }
 
 impl<T> MutexGuard<'_, T> {
@@ -230,5 +228,23 @@ mod tests {
         let lock_attempt_two = mutex.lock();
         assert!(lock_attempt_two.is_ok());
         assert_eq!(*lock_attempt_two.unwrap(), 100);
+    }
+
+    #[test]
+    fn test_speed() {
+        let m = Mutex::new(1);
+        std::hint::black_box(&m);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..5000 {
+                        *m.lock().unwrap() += 1;
+                    }
+                });
+            }
+        });
+        let duration = start.elapsed();
+        println!("locked {} times in {:?}", *m.lock().unwrap(), duration);
     }
 }

@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU32, Ordering};
-use crate::mutex::SlowerMutexGuard;
+use crate::mutex::MutexGuard;
 use atomic_wait::{ wait, wake_one, wake_all};
 
 struct CondVar {
@@ -16,7 +16,7 @@ impl CondVar {
         }
     }
 
-    pub fn wait<'a, T>(&self, mutex_guard: SlowerMutexGuard<'a, T>) -> SlowerMutexGuard<'a, T>
+    pub fn wait<'a, T>(&self, mutex_guard: MutexGuard<'a, T>) -> MutexGuard<'a, T>
     where T: Debug {
         let state = self.counter.load(Ordering::Relaxed);
         self.waiting.fetch_add(1, Ordering::Relaxed);
@@ -47,11 +47,11 @@ mod tests {
     use super::*;
     use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
-    use crate::mutex::SlowerMutex;
+    use crate::mutex::Mutex;
 
     #[test]
     fn test_basic_wait_notify_one() {
-        let mutex = Arc::new(SlowerMutex::new(0));
+        let mutex = Arc::new(Mutex::new(0));
         let cvar = Arc::new(CondVar::new());
         let (tx, rx) = mpsc::channel();
 
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn test_notify_all_multiple_waiters() {
-        let mutex = Arc::new(SlowerMutex::new(0));
+        let mutex = Arc::new(Mutex::new(0));
         let cvar = Arc::new(CondVar::new());
 
         let thread_count = 8;
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn test_waiting_counter() {
-        let mutex = Arc::new(SlowerMutex::new(0));
+        let mutex = Arc::new(Mutex::new(0));
         let cvar = Arc::new(CondVar::new());
 
         let (tx, rx) = mpsc::channel();

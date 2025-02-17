@@ -1,6 +1,6 @@
 use std::cell::{UnsafeCell};
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::thread::{Thread};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -15,30 +15,31 @@ pub type LockResult<Guard> = Result<Guard, LockError<Guard>>;
 
 const UNLOCKED: u8 = 0;
 const LOCKED: u8 = 1;
-const QUEUEING: u8 = 2;
 
 #[derive(Debug)]
-pub struct SlowerMutex<T> {
+pub struct Mutex<T> {
     mutex_id: u64,
     data: UnsafeCell<T>,
+    queue_is_accessed: AtomicBool,
     state: AtomicU8,
     queue: UnsafeCell<std::collections::VecDeque<Thread>>,
     poisoned: UnsafeCell<bool>,
 }
 
-impl<T> SlowerMutex<T> {
+impl<T> Mutex<T> {
 
-    pub fn new(data: T) -> SlowerMutex<T> {
+    pub fn new(data: T) -> Mutex<T> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        SlowerMutex {
+        Mutex {
             mutex_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             data: data.into(),
+            queue_is_accessed: AtomicBool::new(false),
             state: AtomicU8::new(UNLOCKED),
             queue: std::collections::VecDeque::new().into(),
             poisoned: false.into(),
         }
     }
-    pub fn lock(&self) -> LockResult<SlowerMutexGuard<'_,T>> {
+    pub fn lock(&self) -> LockResult<MutexGuard<'_,T>> {
         _ = self.acquired_check()?;
 
         'outer: loop {
@@ -47,6 +48,9 @@ impl<T> SlowerMutex<T> {
                 let state = self.state.load(Ordering::Relaxed);
                 match state {
                     UNLOCKED => {
+                        if self.queue_is_accessed.load(Ordering::Relaxed) {
+                            std::hint::spin_loop();
+                        }
                         if self.state.compare_exchange_weak(
                             UNLOCKED,
                             LOCKED,
@@ -54,18 +58,7 @@ impl<T> SlowerMutex<T> {
                             Ordering::Relaxed,
                         ).is_ok() {
                             break 'outer;
-                        }
-                    },
-                    QUEUEING => {
-                        if self.state.compare_exchange_weak(
-                            QUEUEING,
-                            LOCKED,
-                            Ordering::Acquire,
-                            Ordering::Relaxed,
-                        ).is_ok() {
-                            // or spin further?!
-                            break 'outer;
-                        }
+                        };
                     },
                     LOCKED => {
                         spin_counter += 1;
@@ -74,36 +67,27 @@ impl<T> SlowerMutex<T> {
                 }
                 std::hint::spin_loop();
             }
-            if self.state.compare_exchange(
-                LOCKED,
-                QUEUEING,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ).is_ok() {
-                let current_thread = std::thread::current();
-                unsafe { (*self.queue.get()).push_back(current_thread) };
-                std::thread::park();
-            }
+            self.enqueue_thread();
         }
         self.set_acquired();
         if self.is_poisoned() {
             return Err(LockError::Poisoned(PoisonedLock {
-                guard: SlowerMutexGuard { lock: self },
+                guard: MutexGuard { lock: self },
             }));
         }
 
-        Ok(SlowerMutexGuard { lock: self })
+        Ok(MutexGuard { lock: self })
     }
-    pub fn try_lock(&self) -> LockResult<SlowerMutexGuard<'_,T>> {
+    pub fn try_lock(&self) -> LockResult<MutexGuard<'_,T>> {
         _ = self.acquired_check()?;
         if self.state.compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             self.set_acquired();
             if self.is_poisoned() {
                 return Err(LockError::Poisoned(PoisonedLock {
-                    guard: SlowerMutexGuard { lock: self },
+                    guard: MutexGuard { lock: self },
                 }));
             }
-            return Ok(SlowerMutexGuard { lock: self });
+            return Ok(MutexGuard { lock: self });
         }
         Err(LockError::WouldBlock)
     }
@@ -121,6 +105,60 @@ impl<T> SlowerMutex<T> {
     }
     pub fn get_mut(&mut self) -> &mut T {
         self.data.get_mut()
+    }
+
+    fn enqueue_thread(&self) {
+
+        loop {
+            let queue_accessed = self.queue_is_accessed.load(Ordering::Relaxed);
+            if !queue_accessed {
+                if self.queue_is_accessed.compare_exchange_weak(
+                    false,
+                    true,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ).is_ok() {
+                    let current_thread = std::thread::current();
+                    unsafe { (*self.queue.get()).push_back(current_thread) };
+                    self.queue_is_accessed.store(false, Ordering::Release);
+                    std::thread::park();
+
+                    return;
+                }
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    fn dequeue_thread(&self) {
+        loop {
+            let queue_accessed = self.queue_is_accessed.load(Ordering::Relaxed);
+                if !queue_accessed {
+                    if self.queue_is_accessed.compare_exchange_weak(
+                        false,
+                        true,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    ).is_ok() {
+                        let queue = self.queue.get();
+                        let has_more_waiters = unsafe { !(*queue).is_empty() };
+                        if has_more_waiters {
+                            let thread_to_unpark = unsafe { (*queue).pop_front() };
+                            self.queue_is_accessed.store(false, Ordering::Release);
+                            // self.state.store(QUEUEING, Ordering::Release);
+                            self.state.store(UNLOCKED, Ordering::Release);
+                            if let Some(t) = thread_to_unpark {
+                                t.unpark();
+                            }
+                        } else {
+                            self.queue_is_accessed.store(false, Ordering::Release);
+                            self.state.store(UNLOCKED, Ordering::Release);
+                        }
+                        return;
+                    }
+                }
+                std::hint::spin_loop();
+        }
     }
 
     #[inline]
@@ -148,61 +186,53 @@ impl<T> SlowerMutex<T> {
     }
 }
 
-unsafe impl<T: Send> Send for SlowerMutex<T> {}
-unsafe impl<T: Send> Sync for SlowerMutex<T> {}
+unsafe impl<T: Send> Send for Mutex<T> {}
+unsafe impl<T: Send> Sync for Mutex<T> {}
 
 #[derive(Debug)]
-pub struct SlowerMutexGuard<'a, T> {
-    lock: &'a SlowerMutex<T>,
+pub struct MutexGuard<'a, T> {
+    pub(crate) lock: &'a Mutex<T>,
 }
 
-impl<T> SlowerMutexGuard<'_, T> {
+impl<T> MutexGuard<'_, T> {
     pub fn unlock(self) {
         drop(self);
     }
 }
 
-impl<T> Drop for SlowerMutexGuard<'_, T> {
+impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         if std::thread::panicking() {
             unsafe { *self.lock.poisoned.get() = true };
         }
         self.lock.remove_acquired();
-
-        let queue = self.lock.queue.get();
-        let thread_to_unpark = unsafe { (*queue).pop_front() };
-        let has_more_waiters = unsafe { !(*queue).is_empty() };
-        let new_state = if has_more_waiters { QUEUEING } else { UNLOCKED };
-
-        self.lock.state.store(new_state, Ordering::Release);
-        if let Some(t) = thread_to_unpark {
-            t.unpark();
-        }
+        self.lock.dequeue_thread();
     }
 }
 
-impl<T> Deref for SlowerMutexGuard<'_, T> {
+impl<T> Deref for MutexGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.lock.data.get() }
     }
 }
 
-impl<T> DerefMut for SlowerMutexGuard<'_, T> {
+impl<T> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.lock.data.get() }
     }
 }
 
-impl<T> !Send for SlowerMutexGuard<'_, T> {}
+impl<T> !Send for MutexGuard<'_, T> {}
 
 #[cfg(test)]
 mod tests {
-    use crate::mutex::{LockError, SlowerMutex};
+    use crate::mutex::{LockError, Mutex};
+    use std::sync::Arc;
 
     #[test]
     fn test_basic_locking() {
-        let mutex = SlowerMutex::new(4u8);
+        let mutex = Mutex::new(4u8);
         let locked = mutex.lock().unwrap();
         assert_eq!(*locked, 4);
         drop(locked);
@@ -213,7 +243,7 @@ mod tests {
 
     #[test]
     fn test_try_lock() {
-        let mutex = SlowerMutex::new(4u8);
+        let mutex = Mutex::new(4u8);
         let locked = mutex.lock();
         let try_locked = mutex.try_lock();
         assert!(locked.is_ok());
@@ -222,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_concurrency() {
-        let mutex = std::sync::Arc::new(SlowerMutex::new(0u8));
+        let mutex = std::sync::Arc::new(Mutex::new(0u8));
         {
             let mutex = mutex.clone();
             std::thread::scope(|s| {
@@ -242,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_reentrancy() {
-        let mutex = SlowerMutex::new("shared data");
+        let mutex = Mutex::new("shared data");
         let first_lock = mutex.lock();
         let second_lock = mutex.lock();
         assert!(first_lock.is_ok());
@@ -251,26 +281,65 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn test_unlocking_after_panic() {
-        let mutex = std::sync::Arc::new(SlowerMutex::new(0u8));
+        let m = Mutex::new(0u8);
         {
-            let mutex = mutex.clone();
-            let handle = std::thread::spawn(move || {
-                let mut lock = mutex.lock().unwrap();
-                *lock += 100;
+            let handle = std::thread::scope(|s| {
+                let mut ml = m.lock().unwrap();
+                *ml += 100;
                 panic!("accidentally panicked");
-                *lock += 100
+                //here comes senseless line:
+                *ml += 100;
             });
-            let _ = handle.join();
         }
-        let lock_attempt_one = mutex.lock();
+        let lock_attempt_one = m.lock();
         assert!(lock_attempt_one.is_err());
-        assert!(mutex.is_poisoned());
-        mutex.clear_poison();
+        assert!(m.is_poisoned());
+        m.clear_poison();
         drop(lock_attempt_one);
-        let lock_attempt_two = mutex.lock();
+        let lock_attempt_two = m.lock();
         assert!(lock_attempt_two.is_ok());
         assert_eq!(*lock_attempt_two.unwrap(), 100);
     }
-}
 
+    #[test]
+    fn test_fifo_order() {
+        let mutex = Arc::new(Mutex::new(()));
+        let order = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+
+        let threads: Vec<_> = (0..25).map(|i| {
+            let mutex = mutex.clone();
+            let order = order.clone();
+            std::thread::spawn(move || {
+                let _lock = mutex.lock().unwrap();
+                order.lock().unwrap().push(i);
+            })
+        }).collect();
+
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert_eq!(*order.lock().unwrap(), (0..5).collect::<Vec<_>>());
+    }
+
+
+    #[test]
+    fn test_speed() {
+        let m = Mutex::new(1);
+        std::hint::black_box(&m);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..16 {
+                s.spawn(|| {
+                    for _ in 0..15000 {
+                        *m.lock().unwrap() += 1;
+                    }
+                });
+            }
+        });
+        let duration = start.elapsed();
+        println!("locked {} times in {:?}", *m.lock().unwrap(), duration);
+    }
+}
