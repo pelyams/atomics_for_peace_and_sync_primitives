@@ -194,7 +194,7 @@ impl<T> !Send for MutexGuard<'_, T> {}
 
 #[cfg(test)]
 mod tests {
-    use crate::mutex::{LockError, Mutex};
+    use crate::mutex_v1::{LockError, Mutex};
 
     #[test]
     fn test_basic_locking() {

@@ -13,11 +13,10 @@ For the latter, field _locked: std::atomic::AtomicBool_ is substituted with _loc
 - Unlike spinlock implementation, instead of panicking it returns errors
 - Has more of std-like interface and features
 
-Since atomic property should now have 3 states: UNLOCKED, LOCKED and QUEUING, we can't use reentrancy logic from spinlock implementation anymore. Hence, from now on we check when acquiring the lock if thread local (aka LocalKey) flag is set.
-
 ### Mutex v.2
-- Instead of parking threads in a user-space deque, it relies on futex-ish library atomic_wait library
-- Totally duplicates SlowMutex interface
+- Instead of parking threads in a user-space deque, it relies on futex-ish atomic_wait library
+- Totally duplicates Mutex v.1 interface
+Since atomic property should now have 3 states: UNLOCKED, LOCKED and QUEUING, we can't use reentrancy logic from spinlock implementation anymore. Hence, from now on we check when acquiring the lock if thread local (aka LocalKey) flag is set.
 
 ### RwLock
 - Writer-friendly read-write lock
@@ -31,7 +30,7 @@ Since atomic property should now have 3 states: UNLOCKED, LOCKED and QUEUING, we
 Been considering to use guards for acquiring (and returning permits back in Drop implementation, RAII, you know), but ultimately opted off in favour of semaphore flexibility
 ### Channel
 - MPSC buffered channel
-- Backed by a ring buffer (and hence has a boundary of buffer size being power of 2), buffer entries are aligned to be 64 bytes, to prevent false sharing
+- Backed by a ring buffer (and hence channel has a boundary of buffer size being power of 2)
 
 ### Arc
 - Some regular Arc implementation, a pale imitation of std version.

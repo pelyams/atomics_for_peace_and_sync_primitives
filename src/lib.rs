@@ -1,12 +1,12 @@
 #![feature(negative_impls)]
-#![feature(generic_const_exprs)]
 
 mod spinlock;
-mod mutex;
-mod advanced_mutex;
+mod mutex_v1;
+mod mutex_v2;
 mod rwlock;
-mod utils;
 mod condvar;
 mod semaphore;
 mod channel;
 mod arc;
+
+mod utils;

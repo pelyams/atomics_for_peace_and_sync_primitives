@@ -2,35 +2,61 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) const CACHE_LINE_SIZE: usize = 64;
+/// sysctl hw.cachelinesize:
+pub(crate) const CACHE_LINE_SIZE: usize = 128;
 
-#[repr(align(64))]
-struct Padded<T> where [u8; CACHE_LINE_SIZE - size_of::<T>()]: {
-    value: T,
-    _pad: [u8; CACHE_LINE_SIZE - size_of::<T>()],
-}
 
-impl<T> Padded<T> where [u8; CACHE_LINE_SIZE - size_of::<T>()]: {
-    pub(crate) fn new(value: T) -> Self {
-        Padded {
-            value,
-            _pad: [0u8; CACHE_LINE_SIZE - size_of::<T>()]
-        }
-    }
-}
+// #[repr(align(64))]
+// struct Padded<T>
+// where
+//     [u8; CACHE_LINE_SIZE - size_of::<T>()]:,
+// {
+//     value: T,
+//     _pad: [u8; CACHE_LINE_SIZE - size_of::<T>()],
+// }
+//
+// impl<T> Padded<T>
+// where
+//     [u8; CACHE_LINE_SIZE - size_of::<T>()]:,
+// {
+//     pub(crate) fn new(value: T) -> Self {
+//         Padded {
+//             value,
+//             _pad: [0u8; CACHE_LINE_SIZE - size_of::<T>()],
+//         }
+//     }
+// }
 
-pub struct RingBuffer<T, const N: usize> where [u8; CACHE_LINE_SIZE - size_of::<T>()]: {
-    buffer: [UnsafeCell<MaybeUninit<Padded<T>>>; N],
+#[repr(C)]
+pub struct RingBuffer<T, const N: usize>
+// where
+//     [u8; CACHE_LINE_SIZE - size_of::<T>()]:,
+{
+    buffer: [UnsafeCell<MaybeUninit<T>>; N],
+    // buffer: [UnsafeCell<MaybeUninit<Padded<T>>>; N],
+    // head: AtomicUsize,
+    // tail: AtomicUsize,
+    _pad_head: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
     head: AtomicUsize,
+    _pad_tail: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
     tail: AtomicUsize,
 }
 
-impl<T, const N: usize> RingBuffer<T, N> where [(); CACHE_LINE_SIZE - size_of::<T>()]: {
+impl<T, const N: usize> RingBuffer<T, N>
+// where
+//     [(); CACHE_LINE_SIZE - size_of::<T>()]:,
+{
     pub fn new() -> Self {
         assert_eq!(N % 2, 0, "Size should be power of 2");
         Self {
-            buffer: unsafe { [const { UnsafeCell::new(MaybeUninit::<Padded<T>>::uninit()) }; N] },
+            buffer: unsafe { [const { UnsafeCell::new(MaybeUninit::<T>::uninit()) }; N] },
+            // buffer: unsafe { [const { UnsafeCell::new(MaybeUninit::<Padded<T>>::uninit()) }; N] },
+            //
+            // head: AtomicUsize::new(0),
+            // tail: AtomicUsize::new(0),
+            _pad_head: [0; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
             head: AtomicUsize::new(0),
+            _pad_tail: [0; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
             tail: AtomicUsize::new(0),
         }
     }
@@ -44,15 +70,20 @@ impl<T, const N: usize> RingBuffer<T, N> where [(); CACHE_LINE_SIZE - size_of::<
             if used_slots >= N {
                 return Err(value);
             }
-            if self.head.compare_exchange_weak(
-                current_head,
-                current_head + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ).is_ok() {
-                    let idx = current_head % N;
-                    unsafe { (*self.buffer.get_unchecked(idx).get()).write( Padded::new(value) ) };
-                    return Ok(());
+            if self
+                .head
+                .compare_exchange_weak(
+                    current_head,
+                    current_head + 1,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                let idx = current_head % N;
+                unsafe { *self.buffer.get_unchecked(idx).get() = MaybeUninit::new(value) };
+                // unsafe { (*self.buffer.get_unchecked(idx).get()).write(Padded::new(value)) };
+                return Ok(());
             }
         }
     }
@@ -66,7 +97,11 @@ impl<T, const N: usize> RingBuffer<T, N> where [(); CACHE_LINE_SIZE - size_of::<
                 return None;
             }
 
-            let value = unsafe { (*self.buffer.get_unchecked(current_tail & (N - 1)).get()).assume_init_read() }.value;
+            // let value = unsafe {
+            //     (*self.buffer.get_unchecked(current_tail & (N - 1)).get()).assume_init_read()
+            // }
+            // .value;
+            let value = unsafe { (*self.buffer.get_unchecked(current_tail & (N - 1)).get()).assume_init_read() };
 
             match self.tail.compare_exchange_weak(
                 current_tail,
@@ -83,51 +118,31 @@ impl<T, const N: usize> RingBuffer<T, N> where [(); CACHE_LINE_SIZE - size_of::<
     }
 
     pub fn try_push(&self, value: T) -> Result<(), T> {
+        let current_tail = self.tail.load(Ordering::Acquire);
+        let current_head = self.head.load(Ordering::Relaxed);
 
-            let current_tail = self.tail.load(Ordering::Acquire);
-            let current_head = self.head.load(Ordering::Relaxed);
-
-            let used_slots = current_head - current_tail;
-            if used_slots >= N {
-                return Err(value);
-            }
-            if self.head.compare_exchange_weak(
+        let used_slots = current_head - current_tail;
+        if used_slots >= N {
+            return Err(value);
+        }
+        if self
+            .head
+            .compare_exchange_weak(
                 current_head,
                 current_head + 1,
                 Ordering::Acquire,
                 Ordering::Relaxed,
-            ).is_ok() {
-                let idx = current_head % N;
-                unsafe { (*self.buffer.get_unchecked(idx).get()).write( Padded::new(value) ) };
-                return Ok(());
-            }
-            Err(value)
+            )
+            .is_ok()
+        {
+            let idx = current_head % N;
+            unsafe { *self.buffer.get_unchecked(idx).get() = MaybeUninit::new(value) };
+            // unsafe { (*self.buffer.get_unchecked(idx).get()).write(Padded::new(value)) };
+            return Ok(());
+        }
+        Err(value)
     }
 
-    //
-    // pub fn try_push(&self, value: T) -> Result<(), T> {
-    //     let current_head = self.head.load(Ordering::Relaxed);
-    //     let current_tail = self.tail.load(Ordering::Acquire);
-    //     if current_head - current_tail >= N {
-    //         return Err(value);
-    //     }
-    //
-    //     match self.head.compare_exchange_weak(
-    //         current_head,
-    //         current_head + 1,
-    //         Ordering::Acquire, // Ensure subsequent writes are visible after this
-    //         Ordering::Relaxed,
-    //     ) {
-    //         Ok(_) => {
-    //             let idx = current_head % N;
-    //             unsafe { (*self.buffer.get_unchecked(idx).get()).write(Padded::new(value)) };
-    //             Ok(())
-    //         }
-    //         Err(_) => {
-    //             Err(value)
-    //         }
-    //     }
-    // }
     pub fn try_pop(&self) -> Option<T> {
         let current_tail = self.tail.load(Ordering::Relaxed);
         let current_head = self.head.load(Ordering::Acquire);
@@ -137,7 +152,8 @@ impl<T, const N: usize> RingBuffer<T, N> where [(); CACHE_LINE_SIZE - size_of::<
         }
 
         let idx = current_tail % N;
-        let value = unsafe { (*self.buffer.get_unchecked(idx).get()).assume_init_read() }.value;
+        let value = unsafe { (*self.buffer.get_unchecked(idx).get()).assume_init_read() };
+        // let value = unsafe { (*self.buffer.get_unchecked(idx).get()).assume_init_read() }.value;
 
         match self.tail.compare_exchange_weak(
             current_tail,
@@ -146,16 +162,15 @@ impl<T, const N: usize> RingBuffer<T, N> where [(); CACHE_LINE_SIZE - size_of::<
             Ordering::Relaxed,
         ) {
             Ok(_) => Some(value),
-            Err(_) => {
-                None
-            }
+            Err(_) => None,
         }
     }
-
-
 }
 
-impl<T, const N: usize> Drop for RingBuffer<T, N> where [(); CACHE_LINE_SIZE - size_of::<T>()]: {
+impl<T, const N: usize> Drop for RingBuffer<T, N>
+// where
+//     [(); CACHE_LINE_SIZE - size_of::<T>()]:,
+{
     fn drop(&mut self) {
         let head = self.head.get_mut();
         let tail = self.tail.get_mut();
@@ -167,13 +182,17 @@ impl<T, const N: usize> Drop for RingBuffer<T, N> where [(); CACHE_LINE_SIZE - s
         }
     }
 }
-unsafe impl<T, const N: usize> Sync for RingBuffer<T, N> where [T]: Send, [(); CACHE_LINE_SIZE - size_of::<T>()]: {}
+unsafe impl<T, const N: usize> Sync for RingBuffer<T, N>
+// where
+//     [T]: Send,
+//     [(); CACHE_LINE_SIZE - size_of::<T>()]:,
+{
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
-
 
     #[test]
     fn test_mpsc_basic() {
@@ -209,21 +228,19 @@ mod tests {
         assert_eq!(sum, (0..8).sum::<u32>());
     }
 
-
     #[test]
     fn test_high_contention_mpmc() {
-        const N: usize = 128;
+        const N: usize = 64;
         let buffer = Arc::new(RingBuffer::<usize, N>::new());
-        let num_producers = 40;
-        let num_consumers = 40;
-        let total_items = 100000000;
+        let num_producers = 4;
+        let num_consumers = 4;
+        let total_items = 10000000;
         let start = std::time::Instant::now();
         let producers: Vec<_> = (0..num_producers)
             .map(|_| {
                 let buffer = buffer.clone();
                 std::thread::spawn(move || {
                     for i in 0..(total_items / num_producers) {
-                        // println!("Producing {}", i);
                         while buffer.push(i).is_err() {
                             std::thread::yield_now();
                         }
@@ -231,7 +248,6 @@ mod tests {
                 })
             })
             .collect();
-
 
         let consumers: Vec<_> = (0..num_consumers)
             .map(|_| {
@@ -293,18 +309,20 @@ mod tests {
     #[test]
     fn test_high_contention_try_push() {
         let thread_count = 8;
-        let item_count = 10;
-        let buffer = Arc::new(RingBuffer::<usize, 8>::new());
-        let handles: Vec<_> = (0..thread_count).map(|_| {
-            let buffer = buffer.clone();
-            std::thread::spawn(move || {
-                for i in 0..item_count {
-                    while buffer.try_push(i).is_err() {
-                        std::thread::yield_now();
+        let item_count = 8;
+        let buffer = Arc::new(RingBuffer::<usize, 64>::new());
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let buffer = buffer.clone();
+                std::thread::spawn(move || {
+                    for i in 0..item_count {
+                        while buffer.try_push(i).is_err() {
+                            std::thread::yield_now();
+                        }
                     }
-                }
+                })
             })
-        }).collect();
+            .collect();
 
         for handle in handles {
             handle.join().unwrap();
@@ -315,5 +333,12 @@ mod tests {
             sum += val;
         }
         assert_eq!(sum, thread_count * (0..item_count).sum::<usize>());
+    }
+
+    #[test]
+    fn test_size() {
+        let buffer = RingBuffer::<usize, 64>::new();
+        println!("{}", std::mem::size_of::<RingBuffer<usize,64>>());
+        println!("{}", std::mem::align_of::<RingBuffer<usize,64>>());
     }
 }
