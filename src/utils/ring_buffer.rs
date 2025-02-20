@@ -5,55 +5,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// sysctl hw.cachelinesize:
 pub(crate) const CACHE_LINE_SIZE: usize = 128;
 
-
-// #[repr(align(64))]
-// struct Padded<T>
-// where
-//     [u8; CACHE_LINE_SIZE - size_of::<T>()]:,
-// {
-//     value: T,
-//     _pad: [u8; CACHE_LINE_SIZE - size_of::<T>()],
-// }
-//
-// impl<T> Padded<T>
-// where
-//     [u8; CACHE_LINE_SIZE - size_of::<T>()]:,
-// {
-//     pub(crate) fn new(value: T) -> Self {
-//         Padded {
-//             value,
-//             _pad: [0u8; CACHE_LINE_SIZE - size_of::<T>()],
-//         }
-//     }
-// }
-
 #[repr(C)]
-pub struct RingBuffer<T, const N: usize>
-// where
-//     [u8; CACHE_LINE_SIZE - size_of::<T>()]:,
-{
+pub struct RingBuffer<T, const N: usize> {
     buffer: [UnsafeCell<MaybeUninit<T>>; N],
-    // buffer: [UnsafeCell<MaybeUninit<Padded<T>>>; N],
-    // head: AtomicUsize,
-    // tail: AtomicUsize,
     _pad_head: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
     head: AtomicUsize,
     _pad_tail: [u8; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
     tail: AtomicUsize,
 }
 
-impl<T, const N: usize> RingBuffer<T, N>
-// where
-//     [(); CACHE_LINE_SIZE - size_of::<T>()]:,
-{
+impl<T, const N: usize> RingBuffer<T, N> {
     pub fn new() -> Self {
         assert_eq!(N % 2, 0, "Size should be power of 2");
         Self {
             buffer: unsafe { [const { UnsafeCell::new(MaybeUninit::<T>::uninit()) }; N] },
-            // buffer: unsafe { [const { UnsafeCell::new(MaybeUninit::<Padded<T>>::uninit()) }; N] },
-            //
-            // head: AtomicUsize::new(0),
-            // tail: AtomicUsize::new(0),
             _pad_head: [0; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
             head: AtomicUsize::new(0),
             _pad_tail: [0; CACHE_LINE_SIZE - size_of::<AtomicUsize>()],
@@ -82,7 +47,6 @@ impl<T, const N: usize> RingBuffer<T, N>
             {
                 let idx = current_head % N;
                 unsafe { *self.buffer.get_unchecked(idx).get() = MaybeUninit::new(value) };
-                // unsafe { (*self.buffer.get_unchecked(idx).get()).write(Padded::new(value)) };
                 return Ok(());
             }
         }
@@ -96,11 +60,6 @@ impl<T, const N: usize> RingBuffer<T, N>
             if current_head == current_tail {
                 return None;
             }
-
-            // let value = unsafe {
-            //     (*self.buffer.get_unchecked(current_tail & (N - 1)).get()).assume_init_read()
-            // }
-            // .value;
             let value = unsafe { (*self.buffer.get_unchecked(current_tail & (N - 1)).get()).assume_init_read() };
 
             match self.tail.compare_exchange_weak(
@@ -137,7 +96,6 @@ impl<T, const N: usize> RingBuffer<T, N>
         {
             let idx = current_head % N;
             unsafe { *self.buffer.get_unchecked(idx).get() = MaybeUninit::new(value) };
-            // unsafe { (*self.buffer.get_unchecked(idx).get()).write(Padded::new(value)) };
             return Ok(());
         }
         Err(value)
@@ -153,7 +111,6 @@ impl<T, const N: usize> RingBuffer<T, N>
 
         let idx = current_tail % N;
         let value = unsafe { (*self.buffer.get_unchecked(idx).get()).assume_init_read() };
-        // let value = unsafe { (*self.buffer.get_unchecked(idx).get()).assume_init_read() }.value;
 
         match self.tail.compare_exchange_weak(
             current_tail,
@@ -167,10 +124,7 @@ impl<T, const N: usize> RingBuffer<T, N>
     }
 }
 
-impl<T, const N: usize> Drop for RingBuffer<T, N>
-// where
-//     [(); CACHE_LINE_SIZE - size_of::<T>()]:,
-{
+impl<T, const N: usize> Drop for RingBuffer<T, N> {
     fn drop(&mut self) {
         let head = self.head.get_mut();
         let tail = self.tail.get_mut();
@@ -182,12 +136,7 @@ impl<T, const N: usize> Drop for RingBuffer<T, N>
         }
     }
 }
-unsafe impl<T, const N: usize> Sync for RingBuffer<T, N>
-// where
-//     [T]: Send,
-//     [(); CACHE_LINE_SIZE - size_of::<T>()]:,
-{
-}
+unsafe impl<T, const N: usize> Sync for RingBuffer<T, N> {}
 
 #[cfg(test)]
 mod tests {
