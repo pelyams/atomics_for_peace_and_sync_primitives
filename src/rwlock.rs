@@ -1,11 +1,11 @@
+use atomic_wait::{wait, wake_all, wake_one};
+use std::cell::RefCell;
 use std::cell::UnsafeCell;
+use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Formatter;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use atomic_wait::{wait, wake_one, wake_all};
-use std::cell::RefCell;
-use std::collections::{HashSet};
 
 thread_local! {
     static ACQUIRED_BY_THREAD: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
@@ -22,7 +22,6 @@ pub struct RwLock<T> {
     state: AtomicU32,
     poisoned: UnsafeCell<bool>,
 }
-
 
 impl<T> RwLock<T> {
     pub fn new(data: T) -> RwLock<T> {
@@ -42,16 +41,18 @@ impl<T> RwLock<T> {
         loop {
             if state != u32::MAX {
                 if state == u32::MAX - 1 {
-                    return Err(RwLockError::TooManyReaders)
+                    return Err(RwLockError::TooManyReaders);
                 }
                 while state & 1 == 1 {
                     wait(&self.state, state);
                     state = self.state.load(Ordering::Relaxed);
                 }
-                match self.state.compare_exchange_weak(state,
-                                                       state + 2,
-                                                       Ordering::Acquire,
-                                                       Ordering::Relaxed) {
+                match self.state.compare_exchange_weak(
+                    state,
+                    state + 2,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => {
                         self.set_acquired();
                         if self.is_poisoned() {
@@ -59,8 +60,8 @@ impl<T> RwLock<T> {
                                 guard: RwLockReadGuard { lock: self },
                             }));
                         }
-                        return Ok(RwLockReadGuard { lock: self })
-                    },
+                        return Ok(RwLockReadGuard { lock: self });
+                    }
                     Err(changed_state) => state = changed_state,
                 }
             } else {
@@ -74,21 +75,36 @@ impl<T> RwLock<T> {
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
             if state <= 1 {
-                match self.state.compare_exchange(state, u32::MAX, Ordering::Acquire, Ordering::Relaxed) {
+                match self.state.compare_exchange(
+                    state,
+                    u32::MAX,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => break,
-                    Err(updated_state) => { state = updated_state; continue; }
+                    Err(updated_state) => {
+                        state = updated_state;
+                        continue;
+                    }
                 }
             }
             if state & 1 == 0 {
-                match self.state.compare_exchange(state, state + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                match self.state.compare_exchange(
+                    state,
+                    state + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
                     Ok(_) => (),
-                    Err(updated_state) => { state = updated_state; continue; },
+                    Err(updated_state) => {
+                        state = updated_state;
+                        continue;
+                    }
                 }
             }
             let _waiting_guard = WaitingWriterGuard::new(self);
             let wc = self.writers_number.load(Ordering::Acquire);
             wait(&self.writers_number, wc);
-
         }
         self.set_acquired();
         if self.is_poisoned() {
@@ -103,10 +119,14 @@ impl<T> RwLock<T> {
         _ = self.acquired_check()?;
         let state = self.state.load(Ordering::Relaxed);
         if state <= 1 {
-            if self.state.compare_exchange(state, u32::MAX, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            if self
+                .state
+                .compare_exchange(state, u32::MAX, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
                 self.set_acquired();
                 if self.is_poisoned() {
-                    return Err(RwLockError::Poisoned(PoisonedLock{
+                    return Err(RwLockError::Poisoned(PoisonedLock {
                         guard: RwLockWriteGuard { lock: self },
                     }));
                 }
@@ -125,12 +145,10 @@ impl<T> RwLock<T> {
         if state & 1 == 1 {
             return Err(RwLockError::WouldBlock);
         }
-        match self.state.compare_exchange(
-            state,
-            state + 2,
-            Ordering::Acquire,
-            Ordering::Relaxed
-        ) {
+        match self
+            .state
+            .compare_exchange(state, state + 2, Ordering::Acquire, Ordering::Relaxed)
+        {
             Ok(_) => {
                 self.set_acquired();
                 if self.is_poisoned() {
@@ -139,8 +157,8 @@ impl<T> RwLock<T> {
                     }));
                 }
                 Ok(RwLockReadGuard { lock: self })
-            },
-            Err(_) => Err(RwLockError::WouldBlock)
+            }
+            Err(_) => Err(RwLockError::WouldBlock),
         }
     }
 
@@ -161,9 +179,8 @@ impl<T> RwLock<T> {
 
     #[inline]
     fn acquired_check<Guard>(&self) -> Result<(), RwLockError<Guard>> {
-        if ACQUIRED_BY_THREAD.with(
-            |acquired_lock| acquired_lock.borrow().contains(&self.rwlock_id)
-        ) {
+        if ACQUIRED_BY_THREAD.with(|acquired_lock| acquired_lock.borrow().contains(&self.rwlock_id))
+        {
             return Err(RwLockError::WouldBlock);
         }
         Ok(())
@@ -171,16 +188,12 @@ impl<T> RwLock<T> {
 
     #[inline]
     fn set_acquired(&self) {
-        ACQUIRED_BY_THREAD.with(
-            |acquired_lock| acquired_lock.borrow_mut().insert(self.rwlock_id)
-        );
+        ACQUIRED_BY_THREAD.with(|acquired_lock| acquired_lock.borrow_mut().insert(self.rwlock_id));
     }
 
     #[inline]
     fn remove_acquired(&self) {
-        ACQUIRED_BY_THREAD.with(
-            |acquired_lock| acquired_lock.borrow_mut().remove(&self.rwlock_id)
-        );
+        ACQUIRED_BY_THREAD.with(|acquired_lock| acquired_lock.borrow_mut().remove(&self.rwlock_id));
     }
 }
 
@@ -229,7 +242,6 @@ impl<T> DerefMut for RwLockWriteGuard<'_, T> {
 
 impl<T> !Send for RwLockWriteGuard<'_, T> {}
 
-
 #[derive(Debug)]
 pub struct RwLockReadGuard<'a, T> {
     lock: &'a RwLock<T>,
@@ -276,7 +288,6 @@ impl<'a, T> Drop for WaitingWriterGuard<'a, T> {
     }
 }
 
-
 #[derive(Debug)]
 pub enum RwLockError<Guard> {
     WouldBlock,
@@ -293,14 +304,14 @@ impl<T> PartialEq for RwLockError<T> {
                 } else {
                     false
                 }
-            },
+            }
             RwLockError::TooManyReaders => {
                 if let RwLockError::TooManyReaders = other {
                     true
                 } else {
                     false
                 }
-            },
+            }
             RwLockError::Poisoned(_) => {
                 if let RwLockError::Poisoned(_) = other {
                     true
@@ -340,36 +351,141 @@ impl<T> fmt::Debug for PoisonedLock<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::RwLock;
-    use crate::rwlock::RwLockError;
-
-
-    #[test]
-    fn test_basic_locking() {
-        let rw_lock = RwLock::new(4u8);
-        let locked = rw_lock.write().unwrap();
-        assert_eq!(*locked, 4);
-        drop(locked);
-        let mut locked = rw_lock.write().unwrap();
-        *locked *= 20;
-        assert_eq!(*locked, 80);
-    }
-
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
-    fn test_reentrancy() {
-        let rw_lock = RwLock::new("shared data");
-        let first_lock = rw_lock.read();
-        let second_lock = rw_lock.write();
-        assert!(first_lock.is_ok());
-        assert!(second_lock.is_err());
-        assert_eq!(second_lock.unwrap_err(), RwLockError::WouldBlock);
-    }
-
-    #[test]
-    fn try_read_fails_when_locked_for_write() {
+    fn test_basic_read() {
         let lock = RwLock::new(42);
-        let _guard = lock.write().unwrap();
-        assert!(matches!(lock.try_read(), Err(RwLockError::WouldBlock)));
+        let read_guard = lock.read().unwrap();
+        assert_eq!(*read_guard, 42);
+    }
+
+    #[test]
+    fn test_basic_write() {
+        let lock = RwLock::new(42);
+        let mut write_guard = lock.write().unwrap();
+        *write_guard = 84;
+        assert_eq!(*write_guard, 84);
+    }
+
+    #[test]
+    fn test_multiple_readers() {
+        let lock = Arc::new(RwLock::new(0));
+        let mut handles = vec![];
+        for _ in 0..5 {
+            let lock_clone = Arc::clone(&lock);
+            handles.push(thread::spawn(move || {
+                let read_guard = lock_clone.read().unwrap();
+                thread::sleep(Duration::from_millis(10));
+                *read_guard
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_write_blocks_reads() {
+        let lock = Arc::new(RwLock::new(0));
+        let lock_clone = Arc::clone(&lock);
+        let _write_guard = lock.write().unwrap();
+        let read_thread = thread::spawn(move || {
+            let result = lock_clone.try_read();
+            assert!(matches!(result, Err(RwLockError::WouldBlock)));
+        });
+
+        read_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_write_blocks_writes() {
+        let lock = Arc::new(RwLock::new(0));
+        let lock_clone = Arc::clone(&lock);
+        let _write_guard = lock.write().unwrap();
+        let write_thread = thread::spawn(move || {
+            let result = lock_clone.try_write();
+            assert!(matches!(result, Err(RwLockError::WouldBlock)));
+        });
+        write_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_read_to_write_upgrade_blocked() {
+        let lock = RwLock::new(42);
+        let _read_guard = lock.read().unwrap();
+        let write_result = lock.try_write();
+        assert!(matches!(write_result, Err(RwLockError::WouldBlock)));
+    }
+
+    #[test]
+    fn test_poisoning() {
+        let lock = Arc::new(RwLock::new(0));
+        let lock_clone = Arc::clone(&lock);
+
+        let thread = thread::spawn(move || {
+            let mut guard = lock_clone.write().unwrap();
+            *guard = 42;
+            panic!("deliberate panic to poison lock");
+        });
+        let _ = thread.join();
+        assert!(matches!(lock.try_read(), Err(RwLockError::Poisoned(_))));
+    }
+
+    #[test]
+    fn test_clear_poison() {
+        let lock = Arc::new(RwLock::new(0));
+        let lock_clone = Arc::clone(&lock);
+
+        let thread = thread::spawn(move || {
+            let mut guard = lock_clone.write().unwrap();
+            *guard = 42;
+            panic!("deliberate panic to poison lock");
+        });
+
+        let _ = thread.join();
+        assert!(lock.is_poisoned());
+
+        lock.clear_poison();
+        assert!(!lock.is_poisoned());
+
+        let _guard = lock.read().unwrap();
+    }
+
+    #[test]
+    fn test_get_mut_and_into_inner() {
+        let mut lock = RwLock::new(42);
+
+        {
+            let value = lock.get_mut();
+            *value = 84;
+        }
+
+        let read_guard = lock.read().unwrap();
+        assert_eq!(*read_guard, 84);
+        drop(read_guard);
+
+        let final_value = lock.into_inner();
+        assert_eq!(final_value, 84);
+    }
+
+    #[test]
+    fn test_explicit_unlock() {
+        let lock = RwLock::new(42);
+
+        {
+            let read_guard = lock.read().unwrap();
+            read_guard.unlock();
+            let _write_guard = lock.try_write().unwrap();
+        }
+
+        {
+            let write_guard = lock.write().unwrap();
+            write_guard.unlock();
+            let _read_guard = lock.try_read().unwrap();
+        }
     }
 }
