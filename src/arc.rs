@@ -1,6 +1,6 @@
 use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
-use std::ops::DerefMut;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_REF_COUNT: usize = usize::MAX / 2;
@@ -120,7 +120,7 @@ impl<T> Clone for Arc<T> {
     }
 }
 
-impl<T> std::ops::Deref for Arc<T> {
+impl<T> Deref for Arc<T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { &*(self.inner.as_ref()).data.get() }
@@ -191,7 +191,6 @@ impl<T> Drop for Weak<T> {
 unsafe impl<T: Sync + Send> Send for Weak<T> {}
 unsafe impl<T: Sync + Send> Sync for Weak<T> {}
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,7 +241,7 @@ mod tests {
         }
         assert_eq!(*value, 20);
 
-         let _value = Arc::clone(&value);
+        let _value = Arc::clone(&value);
         assert!(value.get_mut().is_none());
     }
 

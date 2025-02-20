@@ -1,17 +1,21 @@
-use std::cell::UnsafeCell;
-use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use atomic_wait::{wait, wake_one};
 use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::collections::HashSet;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::utils::mutex_common::{ LockError, PoisonedLock };
+use crate::utils::mutex_common::{LockError, PoisonedLock};
 
 pub type LockResult<Guard> = Result<Guard, LockError<Guard>>;
 
 thread_local! {
     static ACQUIRED_BY_THREAD: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
 }
+
+const UNLOCKED: u32 = 0;
+const LOCKED: u32 = 1;
+const LOCKED_HAS_WAITERS: u32 = 2;
 
 #[derive(Debug)]
 pub struct Mutex<T> {
@@ -33,25 +37,32 @@ impl<T> Mutex<T> {
     }
     pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
         _ = self.acquired_check()?;
-        if self.state.compare_exchange_weak(0, 1, Ordering::Acquire,  Ordering::Relaxed).is_err() {
+        if self
+            .state
+            .compare_exchange_weak(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             let mut counter = 0;
-            while counter < 100 && self.state.load(Ordering::Relaxed) != 0 {
+            while counter < 100 && self.state.load(Ordering::Relaxed) != UNLOCKED {
                 counter += 1;
                 std::hint::spin_loop();
             }
-            if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                loop {
-                    let state = self.state.load(Ordering::Relaxed);
-                    if state == 0 {
-                        match self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
-                            Ok(_) => break,
-                            Err(_) => continue,
-                        }
-                    }
-                    if state != 2 {
-                        self.state.store(2, Ordering::Relaxed);
-                    }
-                    wait(&self.state, 2);
+            if self
+                .state
+                .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                while self
+                    .state
+                    .compare_exchange(
+                        UNLOCKED,
+                        LOCKED_HAS_WAITERS,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_err()
+                {
+                    wait(&self.state, LOCKED_HAS_WAITERS);
                 }
             }
         }
@@ -66,14 +77,16 @@ impl<T> Mutex<T> {
     }
     pub fn try_lock(&self) -> LockResult<MutexGuard<'_, T>> {
         _ = self.acquired_check()?;
-        if self.state.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        if self
+            .state
+            .compare_exchange_weak(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
             self.set_acquired();
             if self.is_poisoned() {
-                return Err(LockError::Poisoned(
-                    PoisonedLock {
-                        guard: MutexGuard { lock: self },
-                    }
-                ));
+                return Err(LockError::Poisoned(PoisonedLock {
+                    guard: MutexGuard { lock: self },
+                }));
             }
             return Ok(MutexGuard { lock: self });
         }
@@ -98,9 +111,8 @@ impl<T> Mutex<T> {
 
     #[inline]
     fn acquired_check<Guard>(&self) -> Result<(), LockError<Guard>> {
-        if ACQUIRED_BY_THREAD.with(
-            |acquired_lock| acquired_lock.borrow().contains(&self.mutex_id)
-        ) {
+        if ACQUIRED_BY_THREAD.with(|acquired_lock| acquired_lock.borrow().contains(&self.mutex_id))
+        {
             return Err(LockError::WouldBlock);
         }
         Ok(())
@@ -108,16 +120,12 @@ impl<T> Mutex<T> {
 
     #[inline]
     fn set_acquired(&self) {
-        ACQUIRED_BY_THREAD.with(
-            |acquired_lock| acquired_lock.borrow_mut().insert(self.mutex_id)
-        );
+        ACQUIRED_BY_THREAD.with(|acquired_lock| acquired_lock.borrow_mut().insert(self.mutex_id));
     }
 
     #[inline]
     fn remove_acquired(&self) {
-        ACQUIRED_BY_THREAD.with(
-            |acquired_lock| acquired_lock.borrow_mut().remove(&self.mutex_id)
-        );
+        ACQUIRED_BY_THREAD.with(|acquired_lock| acquired_lock.borrow_mut().remove(&self.mutex_id));
     }
 }
 
@@ -141,7 +149,7 @@ impl<T> Drop for MutexGuard<'_, T> {
             unsafe { *self.lock.poisoned.get() = true };
         }
         self.lock.remove_acquired();
-        if self.lock.state.swap(0,Ordering::Release) == 2 {
+        if self.lock.state.swap(UNLOCKED, Ordering::Release) == LOCKED_HAS_WAITERS {
             wake_one(&self.lock.state);
         }
     }
@@ -231,14 +239,14 @@ mod tests {
     }
 
     #[test]
-    fn test_speed() {
+    fn test_contented() {
         let m = Mutex::new(1);
         std::hint::black_box(&m);
         let start = std::time::Instant::now();
         std::thread::scope(|s| {
-            for _ in 0..4 {
+            for _ in 0..8 {
                 s.spawn(|| {
-                    for _ in 0..5000 {
+                    for _ in 0..1500000 {
                         *m.lock().unwrap() += 1;
                     }
                 });

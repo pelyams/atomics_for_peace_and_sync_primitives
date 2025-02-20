@@ -1,7 +1,7 @@
+use crate::mutex_v1::MutexGuard;
+use atomic_wait::{wait, wake_all, wake_one};
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU32, Ordering};
-use crate::mutex::MutexGuard;
-use atomic_wait::{ wait, wake_one, wake_all};
 
 struct CondVar {
     counter: AtomicU32,
@@ -17,12 +17,14 @@ impl CondVar {
     }
 
     pub fn wait<'a, T>(&self, mutex_guard: MutexGuard<'a, T>) -> MutexGuard<'a, T>
-    where T: Debug {
+    where
+        T: Debug,
+    {
         let state = self.counter.load(Ordering::Relaxed);
         self.waiting.fetch_add(1, Ordering::Relaxed);
         let mutex = mutex_guard.lock;
         mutex_guard.unlock();
-        wait(&self.counter,state);
+        wait(&self.counter, state);
         self.waiting.fetch_sub(1, Ordering::Relaxed);
         mutex.lock().unwrap()
     }
@@ -30,7 +32,6 @@ impl CondVar {
     pub fn notify_one(&self) {
         self.counter.fetch_add(1, Ordering::Relaxed);
         wake_one(&self.counter);
-
     }
 
     pub fn notify_all(&self) {
@@ -41,13 +42,12 @@ impl CondVar {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{mpsc, Arc, Barrier};
+    use crate::mutex_v1::Mutex;
+    use std::sync::{mpsc, Arc};
     use std::thread;
-    use crate::mutex::Mutex;
 
     #[test]
     fn test_basic_wait_notify_one() {
