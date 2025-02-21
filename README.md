@@ -16,7 +16,7 @@ For the latter, field _locked: std::atomic::AtomicBool_ is substituted with _loc
 ### Mutex v.2
 - Instead of parking threads in a user-space deque, it relies on futex-ish atomic_wait library
 - Totally duplicates Mutex v.1 interface
-Since atomic property should now have 3 states: UNLOCKED, LOCKED and QUEUING, we can't use reentrancy logic from spinlock implementation anymore. Hence, from now on we check when acquiring the lock if thread local (aka LocalKey) flag is set.
+Since atomic state property should now take one of 3 states: UNLOCKED, LOCKED and LOCKED_HAS_WAITERS, we can't use reentrancy logic from spinlock or mutex_v1 implementations anymore. Hence, from now on we check when acquiring the lock if thread local (aka LocalKey) flag is set.
 
 ### RwLock
 - Writer-friendly read-write lock
@@ -28,6 +28,7 @@ Since atomic property should now have 3 states: UNLOCKED, LOCKED and QUEUING, we
 ### Semaphore
 - Atomic + futex-alike atomic_wait based implementation
 Been considering to use guards for acquiring (and returning permits back in Drop implementation, RAII, you know), but ultimately opted off in favour of semaphore flexibility
+
 ### Channel
 - MPSC buffered channel
 - Backed by a ring buffer (and hence channel has a boundary of buffer size being power of 2)
